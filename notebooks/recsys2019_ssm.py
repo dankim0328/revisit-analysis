@@ -5,7 +5,7 @@ import os
 from collections import Counter
 from scipy.stats import norm
 
-# 경로 설정
+# 경로 설정ㅇㅇㅇ
 current_dir = os.getcwd()
 if os.path.basename(current_dir) == 'notebooks':
     base_path = os.path.join(os.path.dirname(current_dir), 'data')
