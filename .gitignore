@@ -211,3 +211,6 @@ __marimo__/
 .AppleDouble
 .LSOverride
 Icon
+
+# 데이터 폴더 통째로 제외
+data/

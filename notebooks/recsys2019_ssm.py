@@ -3,23 +3,31 @@
 import pandas as pd
 import os
 
-#test vs code
-# 1. 현재 이 노트북 파일(.ipynb)이 있는 위치를 기준으로 경로 설정
-# '..'은 상위 폴더로 나간다는 뜻입니다. (notebooks -> 프로젝트 루트 -> data)
-base_path = os.path.join('..', 'data')
+# 1. 경로 설정 (노트북 위치가 어디든 프로젝트 루트의 data 폴더를 찾도록 설정)
+current_dir = os.getcwd()
 
+# 만약 현재 위치가 'notebooks' 폴더라면, 한 단계 위로 올라가서 'data' 폴더를 찾습니다.
+if os.path.basename(current_dir) == 'notebooks':
+    base_path = os.path.join(os.path.dirname(current_dir), 'data')
+else:
+    base_path = os.path.join(current_dir, 'data')
 
-# 2. 파일명 설정
 train_file = os.path.join(base_path, 'train.csv')
 metadata_file = os.path.join(base_path, 'item_metadata.csv')
 
-# 3. 데이터 불러오기
-# 1,400만 행 데이터를 다룰 때는 nrows로 먼저 구조를 파악하는 습관이 좋습니다.
-train_head = pd.read_csv(train_file, nrows=5)
-item_metadata_head = pd.read_csv(metadata_file, nrows=5)
+print(f"현재 작업 경로: {current_dir}")
+print(f"데이터를 찾는 경로: {base_path}")
 
-print("--- Train Data Preview ---")
-print(train_head) # VS Code에서는 display 대신 print를 주로 씁니다.
+# 2. 데이터 불러오기
+try:
+    # 1,400만 행 데이터이므로 우선 5줄만 확인
+    train_head = pd.read_csv(train_file, nrows=5)
+    print("\n✅ 데이터 로드 성공! (Train Data Preview)")
+    print(train_head)
+
+except FileNotFoundError:
+    print("\n❌ 여전히 파일을 찾을 수 없습니다.")
+    print(f"확인사항: {base_path} 폴더 안에 'train.csv' 파일이 실제로 있는지 확인해주세요.")
 # %%
 
 # 1. 아이템 관련 액션만 필터링
