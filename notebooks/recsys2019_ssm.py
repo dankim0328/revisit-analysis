@@ -1,12 +1,12 @@
-#%%
-
+# %% [1] 경로 설정 및 데이터 로드 (미리보기 포함)
 import pandas as pd
+import numpy as np
 import os
+from collections import Counter
+from scipy.stats import norm
 
-# 1. 경로 설정 (노트북 위치가 어디든 프로젝트 루트의 data 폴더를 찾도록 설정)
+# 경로 설정
 current_dir = os.getcwd()
-
-# 만약 현재 위치가 'notebooks' 폴더라면, 한 단계 위로 올라가서 'data' 폴더를 찾습니다.
 if os.path.basename(current_dir) == 'notebooks':
     base_path = os.path.join(os.path.dirname(current_dir), 'data')
 else:
@@ -15,106 +15,33 @@ else:
 train_file = os.path.join(base_path, 'train.csv')
 metadata_file = os.path.join(base_path, 'item_metadata.csv')
 
-print(f"현재 작업 경로: {current_dir}")
-print(f"데이터를 찾는 경로: {base_path}")
+# 1. 데이터 로드 전 상위 5행 맛보기 (구조 확인)
+print("--- Train 데이터 상위 5행 미리보기 ---")
+train_preview = pd.read_csv(train_file, nrows=5)
+print(train_preview)
 
-# 2. 데이터 불러오기
-try:
-    # 1,400만 행 데이터이므로 우선 5줄만 확인
-    train_head = pd.read_csv(train_file, nrows=5)
-    print("\n✅ 데이터 로드 성공! (Train Data Preview)")
-    print(train_head)
-
-except FileNotFoundError:
-    print("\n❌ 여전히 파일을 찾을 수 없습니다.")
-    print(f"확인사항: {base_path} 폴더 안에 'train.csv' 파일이 실제로 있는지 확인해주세요.")
-# %%
-
-# 1. 아이템 관련 액션만 필터링
-item_actions = train[train['reference'].str.isnumeric() == True].copy()
-item_actions['reference'] = item_actions['reference'].astype(str)
-
-# 2. 유저별로 그룹화하여 세션 간 이동 확인
-def analyze_user_revisits(group):
-    # 시간순 정렬
-    group = group.sort_values('timestamp')
-
-    seen_items = set()
-    cross_session_revisit = 0
-    sessions = group['session_id'].unique()
-
-    # 첫 번째 세션에서 본 아이템들 저장
-    first_session_items = set(group[group['session_id'] == sessions[0]]['reference'])
-
-    # 두 번째 세션 이후부터, 이전 세션들에서 봤던 아이템을 또 보는지 확인
-    total_revisits = 0
-    if len(sessions) > 1:
-        for i in range(1, len(sessions)):
-            current_session_items = set(group[group['session_id'] == sessions[i]]['reference'])
-            previous_items = set(group[group['session_id'].isin(sessions[:i])]['reference'])
-
-            # 교집합 확인 (이전 세션에서 봤던 걸 현재 세션에서 또 봤는가?)
-            revisited_in_this_session = current_session_items.intersection(previous_items)
-            total_revisits += len(revisited_in_this_session)
-
-    return pd.Series({
-        'total_sessions': len(sessions),
-        'cross_session_revisit_count': total_revisits,
-        'is_multi_session_user': 1 if len(sessions) > 1 else 0
-    })
-
-user_stats = item_actions.groupby('user_id').apply(analyze_user_revisits)
-
-print("--- 유저 단위 세션 간 재방문 분석 ---")
-multi_session_users = user_stats[user_stats['is_multi_session_user'] == 1]
-print(f"2개 이상의 세션을 가진 유저 수: {len(multi_session_users)}")
-print(f"재접속 후 이전 세션 아이템을 다시 본 유저 비율: {(multi_session_users['cross_session_revisit_count'] > 0).mean() * 100:.2f}%")
-
-
-
-import pandas as pd
-
-path = '/content/drive/MyDrive/Recsys2019/'
-
-# 1. 메모리 절약을 위해 데이터 타입을 지정하고 필요한 컬럼만 로드
-# nrows 옵션이 있다면 반드시 제거해야 전체 데이터를 읽습니다.
+# 2. 전체 데이터 로드 (메모리 최적화 타입 지정)
 t_dtypes = {
-    'user_id': 'str',
-    'session_id': 'str',
-    'action_type': 'str',
-    'reference': 'str',
-    'timestamp': 'int64'
+    'user_id': 'str', 'session_id': 'str', 'action_type': 'str',
+    'reference': 'str', 'timestamp': 'int64', 'impressions': 'str', 'prices': 'str'
 }
 
-print("데이터 로딩 시작 (전체 행을 처리합니다)...")
+print("\n전체 데이터 로딩 시작... (시간이 소요될 수 있습니다)")
+train = pd.read_csv(train_file, dtype=t_dtypes)
+print(f"✅ 전체 데이터 로드 완료: {len(train):,} 행")
 
-# chunksize를 사용하여 메모리 초과 방지
-chunks = pd.read_csv(path + 'train.csv',
-                     usecols=['user_id', 'session_id', 'action_type', 'reference', 'timestamp'],
-                     dtype=t_dtypes,
-                     chunksize=500000) # 50만 행씩 끊어서 읽기
+# %% [2] 아이템 관련 액션 필터링
+# reference가 숫자인 아이템 관련 액션만 추출
+item_actions = train[train['reference'].str.isnumeric() == True].copy()
+item_actions['reference'] = item_actions['reference'].astype(str)
+print(f"아이템 액션 필터링 완료: {len(item_actions):,} 행")
 
-full_item_actions = []
-
-for i, chunk in enumerate(chunks):
-    # 아이템 관련 액션이고 reference가 숫자인 것만 남기고 즉시 필터링
-    temp = chunk.dropna(subset=['reference'])
-    temp = temp[temp['reference'].str.isnumeric()]
-    full_item_actions.append(temp)
-    if i % 5 == 0:
-        print(f"{i*500000:,} 행 처리 중...")
-
-# 하나로 합치기
-item_actions = pd.concat(full_item_actions)
-print(f"필터링 완료! 총 아이템 액션 수: {len(item_actions):,}")
-
-# 2. 분석 함수 (경고 메시지 해결을 위해 include_groups=False 대응)
+# %% [3] 세션 간 재방문 분석 함수 및 실행
 def analyze_user_revisits(group):
-    # group은 이제 user_id 컬럼을 포함하지 않는 DataFrame이 됩니다 (pandas 최신버전 대응)
     group = group.sort_values('timestamp')
     sessions = group['session_id'].unique()
-
     total_revisits = 0
+    
     if len(sessions) > 1:
         session_item_sets = [set(group[group['session_id'] == s]['reference']) for s in sessions]
         accumulated_previous_items = set()
@@ -131,191 +58,79 @@ def analyze_user_revisits(group):
         'is_multi_session_user': 1 if len(sessions) > 1 else 0
     })
 
-# 3. 그룹화 실행 (경고 해결을 위해 include_groups=False 추가)
-print("유저별 재방문 분석 중...")
+print("유저별 세션 재방문 분석 중...")
 user_stats = item_actions.groupby('user_id').apply(analyze_user_revisits, include_groups=False)
 
-# 4. 결과 출력
 multi_session_users = user_stats[user_stats['is_multi_session_user'] == 1]
-print("\n--- 전체 데이터 기반 유저 단위 재방문 분석 ---")
-print(f"전체 유저 수: {len(user_stats):,}")
+print("\n--- 유저 단위 재방문 분석 결과 ---")
 print(f"2개 이상의 세션을 가진 유저 수: {len(multi_session_users):,}")
 if len(multi_session_users) > 0:
-    print(f"재접속 후 이전 세션 아이템을 다시 본 유저 비율: {(multi_session_users['cross_session_revisit_count'] > 0).mean() * 100:.2f}%")
-
-# 구글 드라이브의 본인 폴더에 저장
-item_actions.to_csv(path + 'train_filtered_revisitation.csv', index=False)
-
-print("저장 완료! 이제 다음 세션부터는 이 파일만 불러오면 됩니다.")
-
-# 1. 변수명 통일 (기존 item_actions를 train_ready로 복사)
+    revisit_rate = (multi_session_users['cross_session_revisit_count'] > 0).mean() * 100
+    print(f"재접속 후 이전 아이템을 다시 본 유저 비율: {revisit_rate:.2f}%")
+# %% 
+import gc
+del train  # 원본 데이터가 더 이상 필요 없다면 삭제
+gc.collect() # 가비지 컬렉션 강제 실행
+# %% [4] Delta t (재방문 시간 간격) 계산
 train_ready = item_actions.copy()
-
-# 2. 정렬 (유저별 -> 아이템별 -> 시간순)
-# Delta t (재방문 간격)를 계산하기 위해 필수적인 단계입니다.
 train_ready = train_ready.sort_values(['user_id', 'reference', 'timestamp'])
 
-# 3. Delta t 계산 (단위: 시간)
-# 동일 유저가 동일 아이템(reference)을 이전에 언제 봤는지 계산합니다.
+# 이전 방문 시점과의 차이 계산 (시간 단위)
 train_ready['prev_timestamp'] = train_ready.groupby(['user_id', 'reference'])['timestamp'].shift(1)
 train_ready['delta_t'] = (train_ready['timestamp'] - train_ready['prev_timestamp']) / 3600
+print("Delta t 계산 완료.")
 
-# 4. 확인
-print(train_ready[train_ready['delta_t'].notnull()][['user_id', 'reference', 'delta_t']].head())
-
-from scipy.stats import norm
-
-# k 값의 범위에 따른 m(k) 테이블 생성
-k_grid = np.linspace(-5, 5, 1000)
-m_table = norm.pdf(k_grid) - k_grid * (1 - norm.cdf(k_grid))
-
-def get_m(k):
-    # k_grid에서 가장 가까운 인덱스를 찾아 m(k) 반환
-    idx = np.searchsorted(k_grid, k)
-    return m_table[np.clip(idx, 0, len(m_table)-1)]
-
-def simulate_likelihood(params, user_data, D=50):
-    alpha, beta, rho, c, sigma_eta = params
-    total_log_likelihood = 0
-
-    for d in range(D):
-        # 유저별 초기 epsilon_d 생성
-        epsilon_latent = {}
-        current_user_lik = 1.0
-
-        for row in user_data.itertuples():
-            item = row.reference
-            dt = row.delta_t
-
-            # 1. Expected Utility 계산
-            if item in epsilon_latent:
-                # 재방문인 경우 AR(1) 적용
-                expected_epsilon = (rho ** dt) * epsilon_latent[item]
-                sigma_t = np.sqrt(sigma_eta**2 * (1 - rho**(2*dt)) / (1 - rho**2))
-            else:
-                # 첫 검색
-                expected_epsilon = 0
-                sigma_t = sigma_eta
-
-            # 2. Reservation Utility (z_ijt) 계산
-            # z = expected_utility + option_value
-            z = (row.delta_ij + expected_epsilon) + sigma_t * get_m(c / sigma_t)
-
-            # 3. Kernel-smoothed Likelihood (Multivariate Logistic)
-            # Action에 따른 확률 계산 (예: 클릭 확률)
-            prob = 1 / (1 + np.exp(-(z - threshold))) # 단순화된 예시
-            current_user_lik *= prob
-
-            # 4. State Update: 실제 시뮬레이션된 새로운 epsilon 저장
-            new_eta = np.random.normal(0, sigma_eta)
-            epsilon_latent[item] = expected_epsilon + new_eta
-
-        total_log_likelihood += current_user_lik
-
-    return np.log(total_log_likelihood / D)
-
+# %% [5] 가격 정보(Price) 추출 로직 적용
 def extract_clicked_price(row):
     try:
         if pd.isna(row['impressions']) or pd.isna(row['prices']):
             return np.nan
-        imps = row['impressions'].split('|')
-        pris = row['prices'].split('|')
+        imps = str(row['impressions']).split('|')
+        pris = str(row['prices']).split('|')
         if row['reference'] in imps:
-            idx = imps.index(row['reference'])
-            return float(pris[idx])
+            return float(pris[imps.index(row['reference'])])
     except:
         return np.nan
     return np.nan
 
-# 전체 데이터에 적용 (시간이 다소 소요될 수 있습니다)
-print("가격 정보 추출 중...")
-# 앞서 만든 train_ready에 가격 정보를 추가합니다.
-# 원본 train 데이터에서 impressions와 prices 컬럼을 다시 가져와야 할 수 있습니다.
-# train_ready = train_ready.merge(train[['user_id', 'session_id', 'timestamp', 'step', 'impressions', 'prices']], on=...)
-
+print("가격 정보 매칭 중...")
 train_ready['price'] = train_ready.apply(extract_clicked_price, axis=1)
 
-from collections import Counter
+# %% [6] 아이템 메타데이터 로드 및 속성 결합
+item_metadata = pd.read_csv(metadata_file)
 
-# 1. 가장 빈번한 속성 20개 추출
+# 상위 20개 빈번 속성 추출
 all_props = []
 item_metadata['properties'].dropna().apply(lambda x: all_props.extend(x.split('|')))
-top_20_props = [p for p, count in Counter(all_props).most_common(20)]
+top_20_props = [p for p, _ in Counter(all_props).most_common(20)]
 
-# 2. Multi-hot Encoding
+# Multi-hot Encoding
 for prop in top_20_props:
-    item_metadata[f'prop_{prop}'] = item_metadata['properties'].apply(
-        lambda x: 1 if isinstance(x, str) and prop in x else 0
-    )
-
-# 3. 필요한 컬럼만 추출
-item_features = item_metadata[['item_id'] + [f'prop_{p}' for p in top_20_props]]
-item_features['item_id'] = item_features['item_id'].astype(str)
-
-# 4. train_ready와 결합
-train_ready = train_ready.merge(item_features, left_on='reference', right_on='item_id', how='left')
-
-def objective_function(params):
-    # params: [alpha(가격), beta1...beta20(속성), rho(지속성), c(검색비용), sigma_eta(충격)]
-    alpha = params[0]
-    betas = params[1:21]
-    rho = params[21]
-    c = params[22]
-    sigma_eta = params[23]
-
-    # delta_ij 계산 (Intrinsic Utility)
-    # delta_ij = alpha * price + sum(beta_k * prop_k)
-
-    # 10만 명을 다 돌리면 너무 오래 걸리니,
-    # Pilot Study를 위해 유저 1,000명만 샘플링해서 돌리는 것을 추천합니다.
-    sample_users = train_ready['user_id'].unique()[:1000]
-    sample_data = train_ready[train_ready['user_id'].isin(sample_users)]
-
-    # log_likelihood = simulate_likelihood(...) 계산
-    # return -log_likelihood (Scipy minimize는 최소화를 수행하므로)
-    pass
-
-import pandas as pd
-from collections import Counter
-
-# 1. 파일 다시 로드 (경로는 본인의 설정에 맞춰주세요)
-path = '/content/drive/MyDrive/Recsys2019/'
-item_metadata = pd.read_csv(path + 'item_metadata.csv')
-
-# 2. 가장 빈번한 속성 20개 추출
-all_props = []
-item_metadata['properties'].dropna().apply(lambda x: all_props.extend(x.split('|')))
-top_20_props = [p for p, count in Counter(all_props).most_common(20)]
-
-# 3. Multi-hot Encoding
-for prop in top_20_props:
-    # 컬럼명에 공백이 있을 수 있으니 안전하게 처리
     col_name = f"prop_{prop.replace(' ', '_')}"
     item_metadata[col_name] = item_metadata['properties'].apply(
         lambda x: 1 if isinstance(x, str) and prop in x else 0
     )
 
-# 4. 필요한 컬럼만 추출 (item_id와 생성한 속성들)
+# 병합을 위한 특징 데이터프레임 생성
 prop_cols = [f"prop_{p.replace(' ', '_')}" for p in top_20_props]
 item_features = item_metadata[['item_id'] + prop_cols].copy()
 item_features['item_id'] = item_features['item_id'].astype(str)
 
-# 5. 기존 train_ready와 결합
-# (train_ready에 이미 item_id 컬럼이 있다면 중복 방지를 위해 drop 후 결합)
+# 기존 train_ready와 결합
 if 'item_id' in train_ready.columns:
     train_ready = train_ready.drop(columns=['item_id'])
-
 train_ready = train_ready.merge(item_features, left_on='reference', right_on='item_id', how='left')
+print("✅ 아이템 속성 및 가격 정보 결합 완료!")
 
-print("아이템 속성 결합 완료!")
-print(f"결합 후 컬럼 수: {len(train_ready.columns)}")
+# %% [전처리가 끝난 후 저장]
+# 필터링된 데이터만 따로 저장해두면, 다음엔 1,400만 행 전체를 읽을 필요가 없습니다.
+train_ready.to_parquet(os.path.join(base_path, 'train_ready.parquet')) 
+# Parquet 형식은 CSV보다 용량이 훨씬 작고 로딩 속도가 10배 이상 빠릅니다.
 
-# 재방문(delta_t가 있는) 경험이 있는 유저들 중 1,000명 샘플링
-revisit_users = train_ready[train_ready['delta_t'].notnull()]['user_id'].unique()
-sample_user_ids = revisit_users[:1000]
+# %% [7] 최종 분석용 샘플링 (1,000명)
+revisit_users_list = train_ready[train_ready['delta_t'].notnull()]['user_id'].unique()
+sample_df = train_ready[train_ready['user_id'].isin(revisit_users_list[:1000])].copy()
 
-sample_df = train_ready[train_ready['user_id'].isin(sample_user_ids)].copy()
-
-print(f"샘플링된 유저 수: {len(sample_user_ids)}")
-print(f"샘플링된 행 수: {len(sample_df)}")
-# %%
+print(f"최종 샘플 유저 수: {len(sample_df['user_id'].unique())}")
+print(f"최종 샘플 행 수: {len(sample_df)}")
+sample_df[['user_id', 'reference', 'delta_t', 'price'] + prop_cols[:3]].head()
