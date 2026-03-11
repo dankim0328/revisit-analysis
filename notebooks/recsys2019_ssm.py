@@ -3,9 +3,11 @@
 import pandas as pd
 import os
 
+#test vs code
 # 1. 현재 이 노트북 파일(.ipynb)이 있는 위치를 기준으로 경로 설정
 # '..'은 상위 폴더로 나간다는 뜻입니다. (notebooks -> 프로젝트 루트 -> data)
 base_path = os.path.join('..', 'data')
+
 
 # 2. 파일명 설정
 train_file = os.path.join(base_path, 'train.csv')
