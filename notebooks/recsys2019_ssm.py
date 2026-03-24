@@ -30,11 +30,135 @@ print("\n전체 데이터 로딩 시작... (시간이 소요될 수 있습니다
 train = pd.read_csv(train_file, dtype=t_dtypes)
 print(f"✅ 전체 데이터 로드 완료: {len(train):,} 행")
 
-# %% [2] 아이템 관련 액션 필터링
-# reference가 숫자인 아이템 관련 액션만 추출
-item_actions = train[train['reference'].str.isnumeric() == True].copy()
-item_actions['reference'] = item_actions['reference'].astype(str)
-print(f"아이템 액션 필터링 완료: {len(item_actions):,} 행")
+# %% [2] (핵심) Opportunity set 구성: clickout 기준 impressions 폭발(explode)로 negative 샘플 생성
+# - clickout item 이벤트는 (impressions, prices, reference=클릭된 아이템)을 함께 제공
+# - 각 clickout 시점 t에서 impressions 내 모든 아이템 k를 후보로 두고:d
+#   y_chosen = 1(reference==k), 0 otherwise  --> negative samples 생성
+#   delta_t_k = t - last_seen(user,k) (hours), 없으면 0
+#   revisit_k = 1(last_seen 존재), else 0
+#   revisit_choice = 1(y_chosen==1 & revisit_k==1), else 0  --> "재방문 선택" 관측치
+
+# 연산 시간을 제어하기 위한 샘플링 옵션들
+MAX_USERS_FOR_PANEL = 5_000          # panel을 만들 유저 수 상한
+MAX_CLICKOUTS_FOR_PANEL = 100_000    # panel을 만들 clickout 행 상한
+
+clickouts = train[
+    (train['action_type'] == 'clickout item') &
+    train['impressions'].notna() &
+    train['prices'].notna() &
+    train['reference'].notna()
+].copy()
+clickouts['reference'] = clickouts['reference'].astype(str)
+clickouts = clickouts.sort_values(['user_id', 'timestamp']).reset_index(drop=True)
+print(f"✅ clickout item 필터링 완료: {len(clickouts):,} 행")
+
+# 1단계: panel을 만들 유저를 선별 (유저 수를 제한)
+unique_users = clickouts['user_id'].unique()
+if len(unique_users) > MAX_USERS_FOR_PANEL:
+    print(f"⚠️ 유저 수 {len(unique_users):,}명 → panel 생성용으로 상위 {MAX_USERS_FOR_PANEL:,}명만 사용합니다.")
+    keep_users = set(unique_users[:MAX_USERS_FOR_PANEL])
+    clickouts = clickouts[clickouts['user_id'].isin(keep_users)].copy()
+    print(f"   --> panel용 clickout 행: {len(clickouts):,}개")
+
+# 2단계: 여전히 너무 많으면 clickout 행 자체를 제한
+if len(clickouts) > MAX_CLICKOUTS_FOR_PANEL:
+    print(f"⚠️ clickout 행이 {len(clickouts):,}개라서, 연산 시간을 줄이기 위해 상위 {MAX_CLICKOUTS_FOR_PANEL:,}개만 사용합니다.")
+    clickouts = clickouts.head(MAX_CLICKOUTS_FOR_PANEL).copy()
+    print(f"   --> panel 생성에 사용할 clickout 수: {len(clickouts):,}개")
+
+
+def _parse_impressions_prices(impressions, prices):
+    imps = str(impressions).split('|')
+    pris = str(prices).split('|')
+    if len(imps) == 0 or len(imps) != len(pris):
+        return None, None
+    return imps, pris
+
+
+def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
+    """
+    Build an impression-level panel with negative samples.
+
+    Returns DataFrame with columns:
+    user_id, session_id, timestamp,
+    item_id (candidate), price,
+    delta_t, revisit, chosen, revisit_choice,
+    impressions, prices
+    """
+    rng = np.random.default_rng(seed)
+    rows = []
+    last_seen = {}  # user_id -> dict[item_id] = last_timestamp
+
+    for r in clickouts_df.itertuples(index=False):
+        user = r.user_id
+        ts = int(r.timestamp)
+        ref = str(r.reference)
+
+        imps, pris = _parse_impressions_prices(r.impressions, r.prices)
+        if imps is None:
+            continue
+
+        # Always include chosen item; subsample negatives if huge
+        idx_ref = None
+        for i, it in enumerate(imps):
+            if str(it) == ref:
+                idx_ref = i
+                break
+        if idx_ref is None:
+            # inconsistent row (reference not in impressions)
+            continue
+
+        n_imps = len(imps)
+        if n_imps > max_candidates:
+            neg_idx = [i for i in range(n_imps) if i != idx_ref]
+            keep_neg = rng.choice(neg_idx, size=max_candidates - 1, replace=False)
+            keep_idx = np.concatenate([[idx_ref], keep_neg])
+        else:
+            keep_idx = np.arange(n_imps)
+
+        user_map = last_seen.get(user)
+        if user_map is None:
+            user_map = {}
+            last_seen[user] = user_map
+
+        for i in keep_idx:
+            item = str(imps[int(i)])
+            try:
+                price = float(pris[int(i)])
+            except Exception:
+                price = np.nan
+
+            prev_ts = user_map.get(item)
+            revisit = 1 if prev_ts is not None else 0
+            delta_t = 0.0 if prev_ts is None else (ts - prev_ts) / 3600.0
+            chosen = 1 if item == ref else 0
+            revisit_choice = 1 if (chosen == 1 and revisit == 1) else 0
+
+            rows.append({
+                'user_id': user,
+                'session_id': r.session_id,
+                'timestamp': ts,
+                'reference': item,           # candidate item id (keep name `reference` for Notebook compatibility)
+                'price': price,
+                'delta_t': delta_t,
+                'revisit': revisit,
+                'chosen': chosen,
+                'revisit_choice': revisit_choice,
+                'impressions': r.impressions,
+                'prices': r.prices,
+            })
+
+        # Update last_seen AFTER processing this clickout event
+        # (we treat being shown/considered as "seen")
+        for it in imps:
+            user_map[str(it)] = ts
+
+    return pd.DataFrame(rows)
+
+
+print("Opportunity panel 생성 중... (negative samples 포함)")
+panel = build_opportunity_panel(clickouts, max_candidates=25, seed=42)
+print(f"✅ Opportunity panel 생성 완료: {len(panel):,} 행 / 유저 {panel['user_id'].nunique():,}명")
 
 # %% [3] 세션 간 재방문 분석 함수 및 실행
 def analyze_user_revisits(group):
@@ -59,7 +183,7 @@ def analyze_user_revisits(group):
     })
 
 print("유저별 세션 재방문 분석 중...")
-user_stats = item_actions.groupby('user_id').apply(analyze_user_revisits, include_groups=False)
+user_stats = panel.groupby('user_id').apply(analyze_user_revisits, include_groups=False)
 
 multi_session_users = user_stats[user_stats['is_multi_session_user'] == 1]
 print("\n--- 유저 단위 재방문 분석 결과 ---")
@@ -72,29 +196,13 @@ import gc
 del train  # 원본 데이터가 더 이상 필요 없다면 삭제
 gc.collect() # 가비지 컬렉션 강제 실행
 # %% [4] Delta t (재방문 시간 간격) 계산
-train_ready = item_actions.copy()
-train_ready = train_ready.sort_values(['user_id', 'reference', 'timestamp'])
-
-# 이전 방문 시점과의 차이 계산 (시간 단위)
-train_ready['prev_timestamp'] = train_ready.groupby(['user_id', 'reference'])['timestamp'].shift(1)
-train_ready['delta_t'] = (train_ready['timestamp'] - train_ready['prev_timestamp']) / 3600
-print("Delta t 계산 완료.")
+train_ready = panel.copy()
+train_ready = train_ready.sort_values(['user_id', 'reference', 'timestamp']).reset_index(drop=True)
+print("Delta t / revisit / negative samples 포함 데이터 준비 완료.")
 
 # %% [5] 가격 정보(Price) 추출 로직 적용
-def extract_clicked_price(row):
-    try:
-        if pd.isna(row['impressions']) or pd.isna(row['prices']):
-            return np.nan
-        imps = str(row['impressions']).split('|')
-        pris = str(row['prices']).split('|')
-        if row['reference'] in imps:
-            return float(pris[imps.index(row['reference'])])
-    except:
-        return np.nan
-    return np.nan
-
-print("가격 정보 매칭 중...")
-train_ready['price'] = train_ready.apply(extract_clicked_price, axis=1)
+# (이미 panel 생성 시 price를 매칭했으므로 skip)
+print("가격 정보: opportunity panel 생성 단계에서 매칭 완료.")
 
 # %% [6] 아이템 메타데이터 로드 및 속성 결합
 item_metadata = pd.read_csv(metadata_file)
@@ -123,14 +231,36 @@ train_ready = train_ready.merge(item_features, left_on='reference', right_on='it
 print("✅ 아이템 속성 및 가격 정보 결합 완료!")
 
 # %% [전처리가 끝난 후 저장]
-# 필터링된 데이터만 따로 저장해두면, 다음엔 1,400만 행 전체를 읽을 필요가 없습니다.
-train_ready.to_parquet(os.path.join(base_path, 'train_ready.parquet')) 
-# Parquet 형식은 CSV보다 용량이 훨씬 작고 로딩 속도가 10배 이상 빠릅니다.
+# NOTE: 전체 train_ready를 parquet으로 저장하는 작업은 용량/시간 부담이 커서 생략하고,
+#       바로 SMLE용 sample_df만 저장합니다.
 
 # %% [7] 최종 분석용 샘플링 (1,000명)
-revisit_users_list = train_ready[train_ready['delta_t'].notnull()]['user_id'].unique()
-sample_df = train_ready[train_ready['user_id'].isin(revisit_users_list[:1000])].copy()
+all_users = train_ready['user_id'].unique()
+revisit_choice_users = train_ready.loc[train_ready['revisit_choice'] == 1, 'user_id'].unique()
+other_users = np.setdiff1d(all_users, revisit_choice_users)
+
+# Selection-bias 완화: revisit_choice 발생 유저/미발생 유저를 함께 포함 (가능하면 반반)
+rng = np.random.default_rng(42)
+n_total = 1000
+n_pos = min(len(revisit_choice_users), n_total // 2)
+n_neg = min(len(other_users), n_total - n_pos)
+
+sample_users = []
+if n_pos > 0:
+    sample_users.append(rng.choice(revisit_choice_users, size=n_pos, replace=False))
+if n_neg > 0:
+    sample_users.append(rng.choice(other_users, size=n_neg, replace=False))
+sample_users = np.concatenate(sample_users) if len(sample_users) > 0 else rng.choice(all_users, size=min(n_total, len(all_users)), replace=False)
+
+sample_df = train_ready[train_ready['user_id'].isin(sample_users)].copy()
 
 print(f"최종 샘플 유저 수: {len(sample_df['user_id'].unique())}")
 print(f"최종 샘플 행 수: {len(sample_df)}")
-sample_df[['user_id', 'reference', 'delta_t', 'price'] + prop_cols[:3]].head()
+sample_df[['user_id', 'reference', 'delta_t', 'price', 'chosen', 'revisit', 'revisit_choice'] + prop_cols[:3]].head()
+
+# 샘플 저장 (Notebook에서 바로 로드 가능)
+sample_path_parquet = os.path.join(base_path, 'smle_sample.parquet')
+sample_path_csv = os.path.join(base_path, 'smle_sample.csv')
+sample_df.to_parquet(sample_path_parquet, index=False)
+sample_df.to_csv(sample_path_csv, index=False)
+print(f"✅ SMLE 샘플 저장 완료: {sample_path_parquet}, {sample_path_csv}")
