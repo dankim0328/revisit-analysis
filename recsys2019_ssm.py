@@ -87,9 +87,7 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
     """
     rng = np.random.default_rng(seed)
     rows = []
-    # last_seen: user_id -> dict[item_id] = (last_timestamp, last_cum_clicks)
-    last_seen = {}
-    user_clicks = {} # user_id -> int
+    last_seen = {}  # user_id -> dict[item_id] = last_timestamp
 
     for r in clickouts_df.itertuples(index=False):
         user = r.user_id
@@ -118,10 +116,6 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
         else:
             keep_idx = np.arange(n_imps)
 
-        # 현재 유저의 누적 클릭 수 계산 (이벤트마다 1씩 증가)
-        curr_clicks = user_clicks.get(user, 0) + 1
-        user_clicks[user] = curr_clicks
-
         user_map = last_seen.get(user)
         if user_map is None:
             user_map = {}
@@ -134,17 +128,9 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
             except Exception:
                 price = np.nan
 
-            prev_info = user_map.get(item)
-            if prev_info is not None:
-                prev_ts, prev_clicks_item = prev_info
-                revisit = 1
-                delta_t = (ts - prev_ts) / 3600.0
-                n_int = curr_clicks - prev_clicks_item
-            else:
-                revisit = 0
-                delta_t = 0.0
-                n_int = 0
-                
+            prev_ts = user_map.get(item)
+            revisit = 1 if prev_ts is not None else 0
+            delta_t = 0.0 if prev_ts is None else (ts - prev_ts) / 3600.0
             chosen = 1 if item == ref else 0
             revisit_choice = 1 if (chosen == 1 and revisit == 1) else 0
 
@@ -155,7 +141,6 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
                 'reference': item,           # candidate item id (keep name `reference` for Notebook compatibility)
                 'price': price,
                 'delta_t': delta_t,
-                'N_int': n_int,
                 'revisit': revisit,
                 'chosen': chosen,
                 'revisit_choice': revisit_choice,
@@ -163,9 +148,10 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
                 'prices': r.prices,
             })
 
-        # Update last_seen AFTER processing this clickout event (ts, curr_clicks)
+        # Update last_seen AFTER processing this clickout event
+        # (we treat being shown/considered as "seen")
         for it in imps:
-            user_map[str(it)] = (ts, curr_clicks)
+            user_map[str(it)] = ts
 
     return pd.DataFrame(rows)
 
@@ -173,33 +159,6 @@ def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
 print("Opportunity panel 생성 중... (negative samples 포함)")
 panel = build_opportunity_panel(clickouts, max_candidates=25, seed=42)
 print(f"✅ Opportunity panel 생성 완료: {len(panel):,} 행 / 유저 {panel['user_id'].nunique():,}명")
-
-# %% [2.5] N_int (인지적 과부하 변수) 시각화
-import seaborn as sns
-import matplotlib.pyplot as plt
-
-print("N_int 분포 시각화를 시작합니다...")
-
-# 5단위 Binning
-panel['N_int_bin'] = (panel['N_int'] // 5) * 5
-
-# 구간별 revisit_choice 평균 확률 계산
-bin_stats = panel.groupby('N_int_bin')['revisit_choice'].agg(['mean', 'count']).reset_index()
-bin_stats = bin_stats[bin_stats['count'] >= 10]
-
-plt.figure(figsize=(10, 6))
-sns.lineplot(data=bin_stats, x='N_int_bin', y='mean', alpha=0.5, color='gray', label='Bin Average', marker='o')
-sns.regplot(data=bin_stats, x='N_int_bin', y='mean', marker='', line_kws={'color': 'red', 'label': 'Trend Line'}, scatter=False)
-
-plt.title("Probability of Revisit Choice by Cognitive Overload (N_int)")
-plt.xlabel("N_int (Cognitive Overload, Binned by 5)")
-plt.ylabel("Probability of Revisit Choice")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# 파이프라인 정리를 위해 임시 컬럼 삭제
-panel = panel.drop(columns=['N_int_bin'], errors='ignore')
 
 # %% [3] 세션 간 재방문 분석 함수 및 실행
 def analyze_user_revisits(group):

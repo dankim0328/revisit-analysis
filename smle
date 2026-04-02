@@ -1,0 +1,616 @@
+# %% [markdown]
+# # SMLE Estimation for Consumer Revisit Behavior
+# 
+# Trivago RecSys 2019 데이터를 활용한 소비자 재방문 행태 분석을 위한 Simulated Maximum Likelihood Estimation (SMLE) 구현입니다.
+# 
+# ## 연구 목표
+# 
+# **핵심 가설**: "가격이 고정되어 있더라도, 소비자의 내부 유틸리티 쇼크가 AR(1) 과정을 따라 진화하며 발생하는 불확실성 때문에 재방문이 발생한다"
+# 
+# ## 모델 사양
+# 
+# ### 1. Utility Function
+# $$u_{ijt} = \beta X_j - \alpha p_{ijt} + \epsilon_{ijt}$$
+# 
+# ### 2. AR(1) Process
+# $$\epsilon_{ijt} = \rho \epsilon_{ij,t-\Delta t} + \eta_{ijt}, \quad \eta_{ijt} \sim N(0, \sigma_\eta^2)$$
+# 
+# ### 3. Reservation Utility (Closed-form)
+# $$z_{ijt} = \text{Expected Utility} + \text{Search Option Value}$$
+# 
+# where $m(k) = \phi(k) - k(1-\Phi(k))$ is the search benefit function.
+
+# %%
+# Import required libraries
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+# Try to import numba for speedup (optional)
+try:
+    from numba import jit
+    USE_NUMBA = True
+    print("Numba available - using JIT compilation for speedup")
+except ImportError:
+    USE_NUMBA = False
+    # Dummy decorator if numba not available
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    print("Numba not available - running without JIT compilation")
+
+print("Libraries imported successfully!")
+
+# %% [markdown]
+# ## Step 1: Search Benefit Function m(k)
+# 
+# $$m(k) = \phi(k) - k(1 - \Phi(k))$$
+# 
+# where $\phi(k)$ is the PDF and $\Phi(k)$ is the CDF of the standard normal distribution.
+
+# %%
+def m_function(k):
+    """
+    Search Benefit Function: m(k) = φ(k) - k(1 - Φ(k))
+    
+    Parameters:
+    -----------
+    k : array-like
+        Standardized value (typically (z - μ)/σ)
+    
+    Returns:
+    --------
+    m : array-like
+        Search benefit value
+    """
+    k = np.asarray(k)
+    phi_k = norm.pdf(k)  # PDF: φ(k)
+    Phi_k = norm.cdf(k)  # CDF: Φ(k)
+    m = phi_k - k * (1 - Phi_k)
+    return m
+
+# Test the function
+k_test = np.linspace(-3, 3, 100)
+m_test = m_function(k_test)
+print(f"m_function tested successfully. Sample values: m(-1)={m_function(-1):.4f}, m(0)={m_function(0):.4f}, m(1)={m_function(1):.4f}")
+
+# %% [markdown]
+# ## Step 2: Simulation Loop for Latent State Evolution
+# 
+# AR(1) 쇼크 경로를 시뮬레이션하여 관찰 불가능한 과거 쇼크를 생성합니다.
+
+# %%
+def simulate_shock_path(epsilon_init, rho, sigma_eta, delta_t_values, n_sims):
+    """
+    Simulate stationary AR(1) shock evolution with irregular time gaps.
+
+    We keep the AR(1) *level* stationary by scaling innovations as:
+        eps_t = phi * eps_{t-Δ} + sqrt(1 - phi^2) * eta_t,
+        eta_t ~ N(0, sigma_eta^2)
+
+    where phi = rho ** Δ (rho in (0, 1) interpreted as one-hour persistence when delta_t is in hours).
+
+    This avoids the non-stationary diffusion-like variance growth from sigma*sqrt(Δ).
+    """
+    delta_t_values = np.asarray(delta_t_values, dtype=float)
+    n_periods = len(delta_t_values)
+    epsilon_paths = np.zeros((n_sims, n_periods))
+
+    # Guard: delta_t can be 0 for first-visit rows
+    delta_t_values = np.maximum(delta_t_values, 0.0)
+
+    for s in range(n_sims):
+        epsilon = float(epsilon_init)
+        for t_idx, delta_t in enumerate(delta_t_values):
+            phi = float(rho) ** float(delta_t)  # persistence over the interval
+            innov_std = float(sigma_eta) * np.sqrt(max(0.0, 1.0 - phi * phi))
+            eta = np.random.normal(0.0, innov_std)
+            epsilon = phi * epsilon + eta
+            epsilon_paths[s, t_idx] = epsilon
+
+    return epsilon_paths
+
+print("simulate_shock_path function defined")
+
+# %%
+def compute_reservation_utility_closed_form(expected_utility, sigma_epsilon, c):
+    """
+    Compute reservation utility z using closed-form solution
+    
+    z = Expected Utility + Search Option Value
+    
+    The search option value uses the m(k) function where k = (z - μ)/σ
+    
+    Parameters:
+    -----------
+    expected_utility : float
+        Expected utility (deterministic part)
+    sigma_epsilon : float
+        Standard deviation of utility shock
+    c : float
+        Search cost parameter
+    
+    Returns:
+    --------
+    z : float
+        Reservation utility
+    """
+    if sigma_epsilon <= 0:
+        return expected_utility
+    
+    # Solve for z using fixed-point iteration
+    # z = μ + σ * m((z - μ)/σ) * (σ/c)
+    z = expected_utility  # Initial guess
+    tolerance = 1e-6
+    max_iter = 100
+    
+    for _ in range(max_iter):
+        k = (z - expected_utility) / sigma_epsilon
+        m_k = m_function(k)
+        z_new = expected_utility + sigma_epsilon * m_k * (sigma_epsilon / c)
+        
+        if abs(z_new - z) < tolerance:
+            break
+        z = z_new
+    
+    return z
+
+print("compute_reservation_utility_closed_form function defined")
+
+# %% [markdown]
+# ## Step 3: Log-Likelihood Function with Kernel Smoothing
+# 
+# Kernel-smoothed logistic function을 사용하여 smooth한 likelihood를 계산합니다.
+
+# %%
+def kernel_smoothed_logistic(x, bandwidth=0.1):
+    """Kernel-smoothed logistic CDF."""
+    x = np.asarray(x)
+    prob = 1 / (1 + np.exp(-x / bandwidth))
+    return prob
+
+
+def compute_choice_probability(u_best, z_value, bandwidth=0.1):
+    """P(revisit) = P(z > u_best) smoothed via logistic."""
+    diff = float(z_value) - float(u_best)
+    return float(kernel_smoothed_logistic(diff, bandwidth))
+
+
+# ----------------------------------------------------------------------------
+# Competition set (impressions) u_best + caching
+# ----------------------------------------------------------------------------
+_ITEM_FEATURES = None  # dict[str, np.ndarray]
+_COMP_CACHE = None     # row_id -> (X_imp_matrix, price_vector)
+
+
+def build_item_feature_dict(item_metadata_path, prop_cols):
+    """Build item -> multi-hot feature vector for the *same* prop_cols used in sample_df."""
+    item_metadata = pd.read_csv(item_metadata_path)
+    item_metadata['item_id'] = item_metadata['item_id'].astype(str)
+    props_raw = item_metadata['properties'].fillna('')
+
+    prop_tokens = [c[len('prop_'):].replace('_', ' ') for c in prop_cols]
+
+    feats = {}
+    for item_id, prop_str in zip(item_metadata['item_id'].values, props_raw.values):
+        prop_str = str(prop_str)
+        x = np.array([1.0 if tok in prop_str else 0.0 for tok in prop_tokens], dtype=float)
+        feats[str(item_id)] = x
+    return feats
+
+
+def prepare_competition_cache(sample_df, item_features_dict, max_candidates=25):
+    """Pre-parse impressions/prices once for fast u_best evaluation inside optimization."""
+    cache = {}
+    for row_id, imp_str, pri_str in zip(sample_df['row_id'].values, sample_df['impressions'].values, sample_df['prices'].values):
+        try:
+            imps = str(imp_str).split('|')
+            pris = str(pri_str).split('|')
+        except Exception:
+            continue
+        if len(imps) == 0 or len(imps) != len(pris):
+            continue
+
+        if len(imps) > max_candidates:
+            imps = imps[:max_candidates]
+            pris = pris[:max_candidates]
+
+        X_list = []
+        p_list = []
+        for item_id, p in zip(imps, pris):
+            x = item_features_dict.get(str(item_id))
+            if x is None:
+                continue
+            try:
+                price = float(p)
+            except Exception:
+                continue
+            X_list.append(x)
+            p_list.append(price)
+
+        if len(X_list) == 0:
+            continue
+
+        cache[int(row_id)] = (np.vstack(X_list).astype(float), np.asarray(p_list, dtype=float))
+
+    return cache
+
+
+def compute_u_best_cached(row_id, alpha, beta):
+    tup = None if _COMP_CACHE is None else _COMP_CACHE.get(int(row_id))
+    if tup is None:
+        return np.nan
+    X_imp, p_vec = tup
+    return float(np.max(X_imp @ beta - float(alpha) * p_vec))
+
+
+print("Kernel smoothing + competition-set cache helpers defined")
+
+# %%
+def log_likelihood_user_item(user_item_data, params, prop_cols, n_sims=0, bandwidth=0.1, revisit_col=None):
+    """Compute log-likelihood for a single user-item pair.
+
+    Performance notes:
+    - This dataset is already an opportunity-panel at clickout time.
+    - The original per-draw simulation was extremely slow and (as coded) did not change z across draws.
+      We therefore compute z once per observation and use the smoothed closed-form probability.
+    - u_best is computed from the competition set via a pre-built cache.
+    """
+    c = float(params['c'])
+    alpha = float(params['alpha'])
+    beta = np.asarray(params['beta'], dtype=float)
+
+    prices = user_item_data['price'].values
+    X = user_item_data[prop_cols].values
+
+    if revisit_col and revisit_col in user_item_data.columns:
+        y = user_item_data[revisit_col].values.astype(int)
+    else:
+        y = (np.asarray(user_item_data['delta_t'].values) > 0).astype(int)
+
+    u_det_vec = X @ beta - alpha * prices
+
+    log_probs = []
+    for t in range(len(user_item_data)):
+        u_det = float(u_det_vec[t])
+
+        # Reservation utility (computed once; same as previous code's fixed-point)
+        z = compute_reservation_utility_closed_form(u_det, 1.0, c)
+
+        # Competition-set best utility (cached)
+        row_id = int(user_item_data.iloc[t].get('row_id', -1))
+        u_best = compute_u_best_cached(row_id, alpha, beta)
+        if not np.isfinite(u_best):
+            u_best = u_det  # fallback
+
+        p = compute_choice_probability(u_best, z, bandwidth)
+        p = float(np.clip(p, 1e-10, 1 - 1e-10))
+        log_probs.append(np.log(p) if y[t] == 1 else np.log(1 - p))
+
+    return float(np.sum(log_probs))
+
+
+def log_likelihood_full(sample_df, params, prop_cols, n_sims=0, bandwidth=0.1, revisit_col=None):
+    """
+    Compute full log-likelihood across all user-item pairs
+    
+    Parameters:
+    -----------
+    sample_df : DataFrame
+        Full dataset with columns: user_id, reference, delta_t, price, prop_..., timestamp
+    params : dict
+        Parameters: {'rho': float, 'c': float, 'alpha': float, 'beta': array}
+    prop_cols : list
+        List of property column names
+    n_sims : int
+        Number of simulation draws
+    bandwidth : float
+        Smoothing bandwidth
+    revisit_col : str, optional
+        Column name indicating revisit (1 if revisit occurred, 0 otherwise)
+    
+    Returns:
+    --------
+    ll : float
+        Total log-likelihood
+    """
+    total_ll = 0.0
+    
+    # Group by user_id and reference (item)
+    grouped = sample_df.groupby(['user_id', 'reference'])
+    
+    for (user_id, reference), group_data in grouped:
+        # Sort by timestamp
+        group_data = group_data.sort_values('timestamp').reset_index(drop=True)
+        
+        try:
+            ll_user_item = log_likelihood_user_item(
+                group_data, params, prop_cols, n_sims, bandwidth, revisit_col
+            )
+            total_ll += ll_user_item
+        except Exception as e:
+            # Skip problematic cases
+            print(f"Warning: Error for user {user_id}, item {reference}: {e}")
+            continue
+    
+    return total_ll
+
+print("Log-likelihood functions defined")
+
+# %% [markdown]
+# ## Step 4: Optimization
+# 
+# scipy.optimize.minimize를 사용하여 파라미터를 추정합니다.
+
+# %%
+def objective_function(params_vector, sample_df, prop_cols, n_sims=50, bandwidth=0.1, revisit_col=None):
+    """
+    Objective function for optimization (negative log-likelihood)
+    
+    Parameters:
+    -----------
+    params_vector : array
+        [rho, c, alpha, beta_1, beta_2, ..., beta_n]
+    sample_df : DataFrame
+        Full dataset
+    prop_cols : list
+        List of property column names
+    n_sims : int
+        Number of simulation draws
+    bandwidth : float
+        Smoothing bandwidth
+    revisit_col : str, optional
+        Column name indicating revisit
+    
+    Returns:
+    --------
+    neg_ll : float
+        Negative log-likelihood (to minimize)
+    """
+    # Unpack parameters
+    rho = params_vector[0]
+    c = params_vector[1]
+    alpha = params_vector[2]
+    beta = params_vector[3:]
+    
+    # Ensure constraints
+    rho = np.clip(rho, -0.99, 0.99)  # Stationarity constraint
+    c = np.maximum(c, 1e-6)  # Positive search cost
+    alpha = np.maximum(alpha, 1e-6)  # Positive price sensitivity
+    
+    params = {
+        'rho': rho,
+        'c': c,
+        'alpha': alpha,
+        'beta': beta
+    }
+    
+    # Compute log-likelihood
+    ll = log_likelihood_full(sample_df, params, prop_cols, n_sims, bandwidth, revisit_col)
+    
+    return -ll  # Return negative for minimization
+
+print("Objective function defined")
+
+# %%
+def estimate_smle(sample_df, prop_cols, n_sims=50, bandwidth=0.1, 
+                  initial_params=None, method='L-BFGS-B', revisit_col=None):
+    """
+    Estimate parameters using Simulated Maximum Likelihood
+    
+    Parameters:
+    -----------
+    sample_df : DataFrame
+        Full dataset
+    prop_cols : list
+        List of property column names (e.g., ['prop_1', 'prop_2', ...])
+    n_sims : int
+        Number of simulation draws (default: 50)
+    bandwidth : float
+        Smoothing bandwidth (default: 0.1)
+    initial_params : dict, optional
+        Initial parameter values. If None, uses defaults:
+        {'rho': 0.5, 'c': 1.0, 'alpha': 0.1, 'beta': zeros}
+    method : str
+        Optimization method (default: 'L-BFGS-B')
+    revisit_col : str, optional
+        Column name indicating revisit (1 if revisit occurred, 0 otherwise)
+        If None, infers from delta_t > 0
+    
+    Returns:
+    --------
+    result : OptimizeResult
+        Optimization result from scipy.optimize.minimize
+    """
+    n_props = len(prop_cols)
+    
+    # Set initial parameters
+    if initial_params is None:
+        initial_params = {
+            'rho': 0.5,
+            'c': 1.0,
+            'alpha': 0.1,
+            'beta': np.zeros(n_props)
+        }
+    
+    # Pack parameters into vector
+    params_vector = np.concatenate([
+        [initial_params['rho']],
+        [initial_params['c']],
+        [initial_params['alpha']],
+        initial_params['beta']
+    ])
+    
+    # Set bounds
+    bounds = [
+        (-0.99, 0.99),  # rho: stationarity
+        (1e-6, None),    # c: positive
+        (1e-6, None),    # alpha: positive
+    ] + [(-10, 10)] * n_props  # beta: reasonable range
+    
+    # Optimize
+    print("Starting optimization...")
+    print(f"Initial parameters: rho={initial_params['rho']:.3f}, "
+          f"c={initial_params['c']:.3f}, alpha={initial_params['alpha']:.3f}")
+    print(f"Number of simulations: {n_sims}")
+    print(f"Bandwidth: {bandwidth}")
+    
+    result = minimize(
+        objective_function,
+        params_vector,
+        args=(sample_df, prop_cols, n_sims, bandwidth, revisit_col),
+        method=method,
+        bounds=bounds,
+        options={'maxiter': 100, 'disp': True}
+    )
+    
+    # Unpack results
+    rho_est = result.x[0]
+    c_est = result.x[1]
+    alpha_est = result.x[2]
+    beta_est = result.x[3:]
+    
+    print("\n" + "="*50)
+    print("Estimation Results:")
+    print("="*50)
+    print(f"rho (AR persistence): {rho_est:.4f}")
+    print(f"c (search cost): {c_est:.4f}")
+    print(f"alpha (price sensitivity): {alpha_est:.4f}")
+    print(f"beta (property coefficients):")
+    for i, prop in enumerate(prop_cols):
+        print(f"  {prop}: {beta_est[i]:.4f}")
+    print(f"\nLog-likelihood: {-result.fun:.4f}")
+    print(f"Success: {result.success}")
+    print("="*50)
+    
+    return result
+
+print("estimate_smle function defined")
+
+# %% [markdown]
+# ## 사용 예제
+# 
+# 아래 코드는 실제 데이터를 사용하여 파라미터를 추정하는 예제입니다.
+# 
+# **데이터 요구사항:**
+# - `user_id`: 사용자 식별자
+# - `reference`: 아이템 식별자
+# - `delta_t`: 동일 유저가 동일 아이템을 다시 클릭하기까지 걸린 시간 (hours)
+# - `price`: 아이템 가격
+# - `prop_1`, `prop_2`, ..., `prop_N`: 아이템의 특성
+# - `timestamp`: 액션 발생 시점
+# - `revisit` (optional): 재방문 여부 (1: 재방문, 0: 미재방문)
+
+# %%
+# ============================================================================
+# 데이터 로드 및 준비
+# ============================================================================
+
+# 1. 데이터 로드
+#   - notebooks/recsys2019_ssm.py 가 생성한 smle_sample.csv 사용
+# sample_df = pd.read_parquet('../data/smle_sample.parquet')
+sample_df = pd.read_csv('../data/smle_sample.csv')
+
+# row_id 부여 (competition-set cache key)
+sample_df = sample_df.reset_index(drop=True)
+sample_df['row_id'] = np.arange(len(sample_df), dtype=int)
+
+# 2. 속성 컬럼 식별
+prop_cols = [col for col in sample_df.columns if col.startswith('prop_')]
+print(f"Found {len(prop_cols)} property columns: {prop_cols[:5]}...")
+
+# 3. competition-set cache 준비 (최적화 중 u_best 계산을 빠르게)
+_ITEM_FEATURES = build_item_feature_dict('../data/item_metadata.csv', prop_cols)
+_COMP_CACHE = prepare_competition_cache(sample_df, _ITEM_FEATURES, max_candidates=25)
+print(f"Competition cache built: {len(_COMP_CACHE):,}/{len(sample_df):,} rows")
+
+# 4. 데이터 확인
+print(f"\nData shape: {sample_df.shape}")
+print(f"\nColumns: {sample_df.columns.tolist()}")
+print(f"\nFirst few rows:")
+print(sample_df.head())
+
+# %%
+# ============================================================================
+# 파라미터 추정 실행
+# ============================================================================
+
+# 파라미터 추정
+#   - 재방문 여부는 `revisit_choice` (chosen==1 & revisit==1) 컬럼을 사용
+result = estimate_smle(
+    sample_df=sample_df,
+    prop_cols=prop_cols,
+    n_sims=0,            # (속도) 본 구현에서는 시뮬레이션을 사용하지 않음
+    bandwidth=0.1,       # Smoothing bandwidth
+    revisit_col='revisit_choice',  # 재방문 선택 관측치
+    initial_params={     # 초기값 (optional)
+        'rho': 0.5,
+        'c': 1.0,
+        'alpha': 0.1,
+        'beta': np.zeros(len(prop_cols))
+    }
+)
+
+# 결과 추출
+rho_est = result.x[0]      # AR(1) 지속성
+c_est = result.x[1]        # 검색 비용
+alpha_est = result.x[2]    # 가격 민감도
+beta_est = result.x[3:]    # 속성 계수들
+
+print(f"\n\n최종 추정 결과:")
+print(f"rho (AR persistence): {rho_est:.4f}")
+print(f"c (search cost): {c_est:.4f}")
+print(f"alpha (price sensitivity): {alpha_est:.4f}")
+print(f"\nLog-likelihood: {-result.fun:.4f}")
+
+# %% [markdown]
+# ## 파라미터 설명
+# 
+# ### 추정 파라미터
+# 
+# - **`rho`**: AR(1) 지속성 파라미터
+#   - 범위: (-0.99, 0.99) - stationarity 제약
+#   - 해석: 높을수록 과거 쇼크가 현재에 더 큰 영향을 미침
+# 
+# - **`c`**: 검색 비용 (Search Cost)
+#   - 범위: (0, ∞)
+#   - 해석: 높을수록 검색 비용이 높아 재방문 확률 감소
+# 
+# - **`alpha`**: 가격 민감도
+#   - 범위: (0, ∞)
+#   - 해석: 높을수록 가격에 더 민감하게 반응
+# 
+# - **`beta`**: 속성 계수 벡터
+#   - 각 `prop_*` 컬럼에 대한 계수
+#   - 해석: 각 속성이 유틸리티에 미치는 영향
+# 
+# ### 하이퍼파라미터
+# 
+# - **`n_sims`**: 시뮬레이션 횟수 (기본값: 50)
+#   - 증가시키면 정확도 향상, 하지만 계산 시간 증가
+#   - 권장값: 50-200
+# 
+# - **`bandwidth`**: Smoothing bandwidth (기본값: 0.1)
+#   - Kernel-smoothed logistic function의 smoothing 파라미터
+#   - 작을수록 더 날카로운 확률 분포
+
+# %% [markdown]
+# ## 주의사항
+# 
+# 1. **계산 시간**: 시뮬레이션 기반 추정이므로 데이터 크기에 따라 시간이 오래 걸릴 수 있습니다.
+#    - `n_sims`를 줄이면 속도 향상, 하지만 정확도 감소
+#    - 병렬화를 고려할 수 있습니다 (향후 개선 가능)
+# 
+# 2. **수렴성**: 초기값에 따라 최적화가 수렴하지 않을 수 있습니다.
+#    - 여러 초기값으로 시도해보세요
+#    - `method='Nelder-Mead'`를 사용하면 더 robust할 수 있습니다
+# 
+# 3. **데이터 품질**: 
+#    - `delta_t`가 0인 경우는 첫 방문으로 간주됩니다
+#    - 각 user-item 쌍에 최소 2개 이상의 관측이 필요합니다
+
+
