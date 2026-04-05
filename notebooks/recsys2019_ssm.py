@@ -5,7 +5,7 @@ import os
 from collections import Counter
 from scipy.stats import norm
 
-# 경로 설정ㅃㅂ
+# 경로 설정
 current_dir = os.getcwd()
 if os.path.basename(current_dir) == 'notebooks':
     base_path = os.path.join(os.path.dirname(current_dir), 'data')
@@ -35,6 +35,94 @@ print(f"✅ 전체 데이터 로드 완료: {len(train):,} 행")
 item_actions = train[train['reference'].str.isnumeric() == True].copy()
 item_actions['reference'] = item_actions['reference'].astype(str)
 print(f"아이템 액션 필터링 완료: {len(item_actions):,} 행")
+
+MAX_CLICKOUTS_FOR_PANEL = 1000000
+clickouts = item_actions[item_actions['action_type'] == 'clickout item'].copy()
+if len(clickouts) > MAX_CLICKOUTS_FOR_PANEL:
+    print(f"Memory issue: taking top {MAX_CLICKOUTS_FOR_PANEL} clickouts")
+    clickouts = clickouts.head(MAX_CLICKOUTS_FOR_PANEL).copy()
+print(f"   --> panel 생성에 사용할 clickout 수: {len(clickouts):,}개")
+
+def _parse_impressions_prices(impressions, prices):
+    imps = str(impressions).split('|')
+    pris = str(prices).split('|')
+    if len(imps) == 0 or len(imps) != len(pris):
+        return None, None
+    return imps, pris
+
+def build_opportunity_panel(clickouts_df, max_candidates=25, seed=42):
+    rng = np.random.default_rng(seed)
+    
+    cols = {
+        'user_id': [], 'session_id': [], 'timestamp': [], 'reference': [],
+        'price': [], 'delta_t': [], 'revisit': [], 'chosen': [],
+        'revisit_choice': [], 'impressions': [], 'prices': []
+    }
+    last_seen = {}  # user_id -> dict[item_id] = last_timestamp
+
+    for r in clickouts_df.itertuples(index=False):
+        user = r.user_id
+        ts = int(r.timestamp)
+        ref = str(r.reference)
+
+        imps, pris = _parse_impressions_prices(r.impressions, r.prices)
+        if imps is None:
+            continue
+
+        idx_ref = None
+        for i, it in enumerate(imps):
+            if str(it) == ref:
+                idx_ref = i
+                break
+        if idx_ref is None:
+            continue
+
+        n_imps = len(imps)
+        if n_imps > max_candidates:
+            neg_idx = [i for i in range(n_imps) if i != idx_ref]
+            keep_neg = rng.choice(neg_idx, size=max_candidates - 1, replace=False)
+            keep_idx = np.concatenate([[idx_ref], keep_neg])
+        else:
+            keep_idx = np.arange(n_imps)
+
+        user_map = last_seen.get(user)
+        if user_map is None:
+            user_map = {}
+            last_seen[user] = user_map
+
+        for i in keep_idx:
+            item = str(imps[int(i)])
+            try:
+                price = float(pris[int(i)])
+            except Exception:
+                price = np.nan
+
+            prev_ts = user_map.get(item)
+            revisit = 1 if prev_ts is not None else 0
+            delta_t = 0.0 if prev_ts is None else (ts - prev_ts) / 3600.0
+            chosen = 1 if item == ref else 0
+            revisit_choice = 1 if (chosen == 1 and revisit == 1) else 0
+
+            cols['user_id'].append(user)
+            cols['session_id'].append(r.session_id)
+            cols['timestamp'].append(ts)
+            cols['reference'].append(item)
+            cols['price'].append(price)
+            cols['delta_t'].append(delta_t)
+            cols['revisit'].append(revisit)
+            cols['chosen'].append(chosen)
+            cols['revisit_choice'].append(revisit_choice)
+            cols['impressions'].append(r.impressions)
+            cols['prices'].append(r.prices)
+
+        for it in imps:
+            user_map[str(it)] = ts
+
+    return pd.DataFrame(cols)
+
+print("Opportunity panel 생성 중... (negative samples 포함)")
+panel = build_opportunity_panel(clickouts, max_candidates=25, seed=42)
+print(f"✅ Opportunity panel 생성 완료: {len(panel):,} 행 / 유저 {panel['user_id'].nunique():,}명")
 
 # %% [3] 세션 간 재방문 분석 함수 및 실행
 def analyze_user_revisits(group):
@@ -108,7 +196,7 @@ item_metadata['properties'].dropna().apply(lambda x: all_props.extend(x.split('|
 top_20_props = [p for p, _ in Counter(all_props).most_common(20)]
 
 # Multi-hot Encoding
-for prop in top_20_props:
+for prop in []: # top_20_props: (시각화용 RAM 150MB 절약)
     col_name = f"prop_{prop.replace(' ', '_')}"
     item_metadata[col_name] = item_metadata['properties'].apply(
         lambda x: 1 if isinstance(x, str) and prop in x else 0
@@ -116,49 +204,18 @@ for prop in top_20_props:
 
 # 병합을 위한 특징 데이터프레임 생성
 prop_cols = [f"prop_{p.replace(' ', '_')}" for p in top_20_props]
+prop_cols = [c for c in prop_cols if c in item_metadata.columns]
 item_features = item_metadata[['item_id'] + prop_cols].copy()
 item_features['item_id'] = item_features['item_id'].astype(str)
 
 # 기존 train_ready와 결합
 if 'item_id' in train_ready.columns:
     train_ready = train_ready.drop(columns=['item_id'])
-train_ready = train_ready.merge(item_features, left_on='reference', right_on='item_id', how='left')
+# train_ready = train_ready.merge(item_features, left_on='reference', right_on='item_id', how='left')
 print("✅ 아이템 속성 및 가격 정보 결합 완료!")
 
-# %% [전처리가 끝난 후 저장]
-# NOTE: 전체 train_ready를 parquet으로 저장하는 작업은 용량/시간 부담이 커서 생략하고,
-#       바로 SMLE용 sample_df만 저장합니다.
+# (데이터(test sample) 추출 및 저장 코드는 별도 파일로 분리 기획)
 
-# %% [7] 최종 분석용 샘플링 (1,000명)
-all_users = train_ready['user_id'].unique()
-revisit_choice_users = train_ready.loc[train_ready['revisit_choice'] == 1, 'user_id'].unique()
-other_users = np.setdiff1d(all_users, revisit_choice_users)
-
-# Selection-bias 완화: revisit_choice 발생 유저/미발생 유저를 함께 포함 (가능하면 반반)
-rng = np.random.default_rng(42)
-n_total = 1000
-n_pos = min(len(revisit_choice_users), n_total // 2)
-n_neg = min(len(other_users), n_total - n_pos)
-
-sample_users = []
-if n_pos > 0:
-    sample_users.append(rng.choice(revisit_choice_users, size=n_pos, replace=False))
-if n_neg > 0:
-    sample_users.append(rng.choice(other_users, size=n_neg, replace=False))
-sample_users = np.concatenate(sample_users) if len(sample_users) > 0 else rng.choice(all_users, size=min(n_total, len(all_users)), replace=False)
-
-sample_df = train_ready[train_ready['user_id'].isin(sample_users)].copy()
-
-print(f"최종 샘플 유저 수: {len(sample_df['user_id'].unique())}")
-print(f"최종 샘플 행 수: {len(sample_df)}")
-sample_df[['user_id', 'reference', 'delta_t', 'N_int', 'price', 'chosen', 'revisit', 'revisit_choice'] + prop_cols[:3]].head()
-
-# 샘플 저장 (Notebook에서 바로 로드 가능)
-sample_path_parquet = os.path.join(base_path, 'smle_sample.parquet')
-sample_path_csv = os.path.join(base_path, 'smle_sample.csv')
-sample_df.to_parquet(sample_path_parquet, index=False)
-sample_df.to_csv(sample_path_csv, index=False)
-print(f"✅ SMLE 샘플 저장 완료: {sample_path_parquet}, {sample_path_csv}")
 
 # %% [8] 인지적 과부하(N_int)와 재방문 확률 시각화
 import matplotlib.pyplot as plt
@@ -197,9 +254,11 @@ plt.grid(True, linestyle='--', alpha=0.6)
 plt.show()
 
 # 2. X축 연속형 변수 치환 Regplot (개별 수치 연속성)
+# 데이터가 900만 개로 너무 많아 seaborn의 logistic 부트스트랩 계산 시 MemoryError가 발생하므로
+# 추세선을 그리기엔 충분히 방대한 10만 개만 랜덤 샘플링하여 시각화합니다.
 plt.figure(figsize=(10, 6))
 sns.regplot(
-    data=revisit_opp_df, 
+    data=revisit_opp_df.sample(n=min(100000, len(revisit_opp_df)), random_state=42), 
     x='N_int', 
     y='revisit_choice', 
     logistic=True,  # Y가 0, 1인 이항 데이터이므로 logistic regression 적용
@@ -290,3 +349,4 @@ plt.legend()
 plt.ylim(0, time_stats_valid['mean'].max() * 1.2)
 plt.grid(axis='y', linestyle='--', alpha=0.6)
 plt.show()
+# %%

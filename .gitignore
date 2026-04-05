@@ -214,7 +214,7 @@ Icon
 
 # 데이터 폴더 통째로 제외
 data/
-
-data/
 *.csv
+*.parquet
+*.log
 *.ipynb_checkpoints/
